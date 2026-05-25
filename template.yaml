@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: High-Performance Notification Service with Email and SMS support
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+Globals:
+  Function:
+    Runtime: nodejs18.x
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref NotificationTable
+        TEMPLATES_BUCKET: !Ref TemplatesBucket
+        ENVIRONMENT: !Ref Environment
+
+Resources:
+  # SNS Topic - Entry point for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Environment}-notification-topic
+      DisplayName: Notification Service Topic
+      
+  # Email SQS Queue
+  EmailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-email-notification-queue
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmailDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Email Dead Letter Queue
+  EmailDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-email-notification-dlq
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SMS SQS Queue
+  SmsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-sms-notification-queue
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SmsDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SMS Dead Letter Queue
+  SmsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-sms-notification-dlq
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SNS Subscription to Email Queue
+  EmailQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !GetAtt EmailQueue.Arn
+      FilterPolicy:
+        type:
+          - email
+      RawMessageDelivery: true
+
+  # SNS Subscription to SMS Queue
+  SmsQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !GetAtt SmsQueue.Arn
+      FilterPolicy:
+        type:
+          - sms
+      RawMessageDelivery: true
+
+  # SQS Queue Policy for Email Queue
+  EmailQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EmailQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: SQS:SendMessage
+            Resource: !GetAtt EmailQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationTopic
+
+  # SQS Queue Policy for SMS Queue
+  SmsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SmsQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: SQS:SendMessage
+            Resource: !GetAtt SmsQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationTopic
+
+  # S3 Bucket for Email Templates
+  TemplatesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${Environment}-notification-templates-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DynamoDB Table for Notification Tracking
+  NotificationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${Environment}-notifications
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: notificationId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: type
+          AttributeType: S
+      KeySchema:
+        - AttributeName: notificationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: type-timestamp-index
+          KeySchema:
+            - AttributeName: type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Email Worker Lambda Function
+  EmailWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-email-worker
+      CodeUri: src/email_worker/
+      Handler: index.handler
+      Description: Processes email notifications from SQS queue
+      Environment:
+        Variables:
+          SES_REGION: !Ref AWS::Region
+          FROM_EMAIL: !Sub noreply@${Environment}.example.com
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EmailDLQ.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationTable
+        - S3ReadPolicy:
+            BucketName: !Ref TemplatesBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+      Events:
+        EmailQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmailQueue.Arn
+            BatchSize: 10
+            Enabled: true
+
+  # SMS Worker Lambda Function
+  SmsWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-sms-worker
+      CodeUri: src/sms_worker/
+      Handler: index.handler
+      Description: Processes SMS notifications from SQS queue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt SmsDLQ.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: '*'
+      Events:
+        SmsQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SmsQueue.Arn
+            BatchSize: 10
+            Enabled: true
+
+  # CloudWatch Log Groups
+  EmailWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Environment}-email-worker
+      RetentionInDays: 7
+
+  SmsWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Environment}-sms-worker
+      RetentionInDays: 7
+
+  # CloudWatch Alarms
+  EmailDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-email-dlq-messages
+      AlarmDescription: Alert when messages appear in Email DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EmailDLQ.QueueName
+
+  SmsDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${Environment}-sms-dlq-messages
+      AlarmDescription: Alert when messages appear in SMS DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SmsDLQ.QueueName
+
+Outputs:
+  NotificationTopicArn:
+    Description: SNS Topic ARN for publishing notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub ${Environment}-NotificationTopicArn
+
+  NotificationTopicName:
+    Description: SNS Topic Name
+    Value: !GetAtt NotificationTopic.TopicName
+    Export:
+      Name: !Sub ${Environment}-NotificationTopicName
+
+  EmailQueueUrl:
+    Description: Email SQS Queue URL
+    Value: !Ref EmailQueue
+
+  SmsQueueUrl:
+    Description: SMS SQS Queue URL
+    Value: !Ref SmsQueue
+
+  TemplatesBucketName:
+    Description: S3 Bucket for email templates
+    Value: !Ref TemplatesBucket
+    Export:
+      Name: !Sub ${Environment}-TemplatesBucketName
+
+  NotificationTableName:
+    Description: DynamoDB Table for notifications
+    Value: !Ref NotificationTable
+    Export:
+      Name: !Sub ${Environment}-NotificationTableName
+
+  EmailWorkerFunctionArn:
+    Description: Email Worker Lambda ARN
+    Value: !GetAtt EmailWorkerFunction.Arn
+
+  SmsWorkerFunctionArn:
+    Description: SMS Worker Lambda ARN
+    Value: !GetAtt SmsWorkerFunction.Arn
