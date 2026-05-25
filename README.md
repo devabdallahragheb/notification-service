@@ -430,7 +430,7 @@ aws s3 rb s3://$BUCKET_NAME
 
 ## 📝 License
 
-MIT License
+Abdullah Abdelglil License
 
 ## 👤 Author
 
